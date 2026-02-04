@@ -1,0 +1,21 @@
+name = "stundenplan-push-service"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# KV Namespace für Device Tokens und Cache
+[[kv_namespaces]]
+binding = "DEVICES"
+id = "ecfg_ehmybdgoala1zk6ltc4bretzen1t" # Wird von 'wrangler kv:namespace create DEVICES' generiert
+
+# Cron Job - Prüft alle 15 Minuten
+[triggers]
+crons = ["*/15 * * * *"]
+
+# Environment Variables (öffentlich)
+[vars]
+# Deine Werte hier eintragen:
+APNS_KEY_ID = "FA98BQMQH2"      # z.B. "ABC123DEFG"
+APNS_TEAM_ID = "7S4JHJ2A99"    # z.B. "XYZ789UVWX"
+
+# Secrets (privat - via 'wrangler secret put' setzen):
+# APNS_PRIVATE_KEY - Der komplette .p8 Key Content
