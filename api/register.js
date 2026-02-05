@@ -34,7 +34,7 @@ export default async function handler(req, res) {
       registeredAt: new Date().toISOString(),
     };
     
-    await kv.set(`device:${deviceToken}`, JSON.stringify(device));
+    await kv.set(`device:${deviceToken}`, device);
     
     // Füge zur Klassen-Liste hinzu
     const classTokens = await kv.get(`class:${className}`) || [];
