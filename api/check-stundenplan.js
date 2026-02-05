@@ -283,7 +283,13 @@ async function removeDeviceToken(deviceToken) {
   const deviceData = await kv.get(`device:${deviceToken}`);
   
   if (deviceData) {
-    const device = JSON.parse(deviceData);
+    // Parse device data
+    let device;
+    if (typeof deviceData === 'string') {
+      device = JSON.parse(deviceData);
+    } else {
+      device = deviceData;
+    }
     
     // Entferne aus Klassen-Liste
     const classTokens = await kv.get(`class:${device.className}`) || [];
