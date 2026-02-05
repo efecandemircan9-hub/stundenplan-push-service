@@ -98,7 +98,7 @@ async function checkStundenplanForClass(className, mapping) {
   
   // Basic Auth Header erstellen
   const username = 'schueler';
-  const password = 'Stundenplan';
+  const password = 'stundenplan';
   const basicAuth = 'Basic ' + Buffer.from(username + ':' + password).toString('base64');
   
   const response = await fetch(url, {
