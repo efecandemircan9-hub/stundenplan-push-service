@@ -96,10 +96,10 @@ async function checkStundenplanForClass(className, mapping) {
   // Lade Stundenplan mit Basic Auth
   const url = `${CONFIG.BKB_BASE_URL}/schueler/${weekFormatted}/c/${slug}`;
   
-  // Basic Auth Header erstellen
+  // Basic Auth Header erstellen (Edge Runtime kompatibel)
   const username = 'schueler';
   const password = 'stundenplan';
-  const basicAuth = 'Basic ' + Buffer.from(username + ':' + password).toString('base64');
+  const basicAuth = 'Basic ' + btoa(username + ':' + password);
   
   const response = await fetch(url, {
     headers: {
@@ -123,11 +123,13 @@ async function checkStundenplanForClass(className, mapping) {
   
   if (!cachedData) {
     // Erster Check - speichere
-    await kv.set(cacheKey, JSON.stringify({
+    const cacheData = {
       hash: newHash,
       redCount: countRedEntries(htmlText),
       updatedAt: new Date().toISOString(),
-    }));
+    };
+    
+    await kv.set(cacheKey, cacheData);
     
     return {
       className,
@@ -136,7 +138,13 @@ async function checkStundenplanForClass(className, mapping) {
     };
   }
   
-  const cached = JSON.parse(cachedData);
+  // Parse cache data (handle both string and object)
+  let cached;
+  if (typeof cachedData === 'string') {
+    cached = JSON.parse(cachedData);
+  } else {
+    cached = cachedData;
+  }
   
   // Vergleiche
   if (cached.hash === newHash) {
@@ -159,11 +167,13 @@ async function checkStundenplanForClass(className, mapping) {
     await sendPushToClass(className, difference);
     
     // Update cache
-    await kv.set(cacheKey, JSON.stringify({
+    const newCacheData = {
       hash: newHash,
       redCount: newRedCount,
       updatedAt: new Date().toISOString(),
-    }));
+    };
+    
+    await kv.set(cacheKey, newCacheData);
     
     return {
       className,
