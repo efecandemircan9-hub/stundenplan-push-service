@@ -93,9 +93,19 @@ async function checkStundenplanForClass(className, mapping) {
   const week = getWeekNumber(new Date());
   const weekFormatted = String(week).padStart(2, '0');
   
-  // Lade Stundenplan
+  // Lade Stundenplan mit Basic Auth
   const url = `${CONFIG.BKB_BASE_URL}/schueler/${weekFormatted}/c/${slug}`;
-  const response = await fetch(url);
+  
+  // Basic Auth Header erstellen
+  const username = 'schueler';
+  const password = 'Stundenplan';
+  const basicAuth = 'Basic ' + Buffer.from(username + ':' + password).toString('base64');
+  
+  const response = await fetch(url, {
+    headers: {
+      'Authorization': basicAuth,
+    },
+  });
   
   if (!response.ok) {
     throw new Error(`Failed to fetch stundenplan: ${response.status}`);
