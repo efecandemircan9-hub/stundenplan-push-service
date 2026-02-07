@@ -1,5 +1,5 @@
 // api/check-stundenplan.js
-// Vercel Serverless Function
+// Vercel Serverless Function - Verbesserte Version mit korrekter Timestamp-Normalisierung
 
 import { kv } from '@vercel/kv';
 import jwt from 'jsonwebtoken';
@@ -96,7 +96,6 @@ async function checkStundenplanForClass(className, mapping) {
   // Lade Stundenplan mit Basic Auth
   const url = `${CONFIG.BKB_BASE_URL}/schueler/${weekFormatted}/c/${slug}`;
   
-  // Basic Auth Header erstellen (Edge Runtime kompatibel)
   const username = 'schueler';
   const password = 'stundenplan';
   const basicAuth = 'Basic ' + btoa(username + ':' + password);
@@ -113,9 +112,12 @@ async function checkStundenplanForClass(className, mapping) {
   
   const htmlText = await response.text();
   
-  // Normalisiere und hash
+  // ============================================================
+  // WICHTIG: Normalisiere HTML (entferne Timestamps & Datumsangaben)
+  // ============================================================
   const normalizedHTML = normalizeHTML(htmlText);
   const newHash = hashString(normalizedHTML);
+  const newRedCount = countRedEntries(htmlText);
   
   // Lade Cache
   const cacheKey = `cache:${className}:w${week}`;
@@ -125,11 +127,14 @@ async function checkStundenplanForClass(className, mapping) {
     // Erster Check - speichere
     const cacheData = {
       hash: newHash,
-      redCount: countRedEntries(htmlText),
+      redCount: newRedCount,
+      normalizedHTML: normalizedHTML, // Speichere normalisiertes HTML
       updatedAt: new Date().toISOString(),
     };
     
     await kv.set(cacheKey, cacheData);
+    
+    console.log(`✅ ${className}: First check - cached`);
     
     return {
       className,
@@ -138,7 +143,7 @@ async function checkStundenplanForClass(className, mapping) {
     };
   }
   
-  // Parse cache data (handle both string and object)
+  // Parse cache data
   let cached;
   if (typeof cachedData === 'string') {
     cached = JSON.parse(cachedData);
@@ -146,8 +151,17 @@ async function checkStundenplanForClass(className, mapping) {
     cached = cachedData;
   }
   
-  // Vergleiche
+  console.log(`🔍 ${className}: Comparing...`);
+  console.log(`   Cached hash: ${cached.hash}`);
+  console.log(`   New hash:    ${newHash}`);
+  console.log(`   Cached red:  ${cached.redCount || 0}`);
+  console.log(`   New red:     ${newRedCount}`);
+  
+  // ============================================================
+  // VERGLEICH: Hash unterschiedlich = Inhalt hat sich geändert
+  // ============================================================
   if (cached.hash === newHash) {
+    console.log(`✅ ${className}: No changes`);
     return {
       className,
       status: 'no_changes',
@@ -155,21 +169,31 @@ async function checkStundenplanForClass(className, mapping) {
     };
   }
   
-  // Hash unterschiedlich - prüfe rote Einträge
-  const oldRedCount = cached.redCount || 0;
-  const newRedCount = countRedEntries(htmlText);
+  // Hash unterschiedlich!
+  console.log(`⚠️  ${className}: Hash changed!`);
   
+  // ============================================================
+  // Prüfe ob es eine RELEVANTE Änderung ist
+  // ============================================================
+  
+  const oldRedCount = cached.redCount || 0;
+  
+  // Fall 1: Mehr rote Einträge = Ausfälle/Änderungen
   if (newRedCount > oldRedCount) {
-    const difference = Math.max(1, Math.floor((newRedCount - oldRedCount) / 4));
-    console.log(`🚨 ${className}: ${difference} new changes!`);
+    const difference = newRedCount - oldRedCount;
+    const changes = Math.max(1, Math.floor(difference / 4)); // ~4 rote Tags pro Ausfall
+    
+    console.log(`🚨 ${className}: ${changes} new changes detected!`);
+    console.log(`   Red count: ${oldRedCount} → ${newRedCount} (+${difference})`);
     
     // Sende Push
-    await sendPushToClass(className, difference);
+    await sendPushToClass(className, changes);
     
     // Update cache
     const newCacheData = {
       hash: newHash,
       redCount: newRedCount,
+      normalizedHTML: normalizedHTML,
       updatedAt: new Date().toISOString(),
     };
     
@@ -178,15 +202,59 @@ async function checkStundenplanForClass(className, mapping) {
     return {
       className,
       status: 'changes_detected',
-      changes: difference,
+      changes,
+      redCountChange: `${oldRedCount} → ${newRedCount}`,
       pushed: true,
     };
   }
   
+  // Fall 2: Weniger rote Einträge = Ausfälle wurden entfernt
+  if (newRedCount < oldRedCount) {
+    const difference = oldRedCount - newRedCount;
+    
+    console.log(`ℹ️  ${className}: ${difference} red entries removed (cancellations cleared)`);
+    
+    // Update cache (ohne Push)
+    const newCacheData = {
+      hash: newHash,
+      redCount: newRedCount,
+      normalizedHTML: normalizedHTML,
+      updatedAt: new Date().toISOString(),
+    };
+    
+    await kv.set(cacheKey, newCacheData);
+    
+    return {
+      className,
+      status: 'changes_cleared',
+      message: 'Ausfälle wurden entfernt',
+      redCountChange: `${oldRedCount} → ${newRedCount}`,
+      pushed: false,
+    };
+  }
+  
+  // Fall 3: Hash unterschiedlich, aber gleiche redCount
+  // = Nur Text/Raum/Lehrer geändert (auch wichtig!)
+  console.log(`📝 ${className}: Content changed (same red count)`);
+  
+  // Sende trotzdem Push (könnte Raumänderung sein!)
+  await sendPushToClass(className, 1, 'Stundenplan aktualisiert');
+  
+  // Update cache
+  const newCacheData = {
+    hash: newHash,
+    redCount: newRedCount,
+    normalizedHTML: normalizedHTML,
+    updatedAt: new Date().toISOString(),
+  };
+  
+  await kv.set(cacheKey, newCacheData);
+  
   return {
     className,
-    status: 'hash_different_no_changes',
-    message: 'Probably timestamp change',
+    status: 'content_changed',
+    message: 'Stundenplan wurde aktualisiert (gleiche Anzahl Ausfälle)',
+    pushed: true,
   };
 }
 
@@ -194,7 +262,7 @@ async function checkStundenplanForClass(className, mapping) {
 // PUSH NOTIFICATIONS
 // ============================================================================
 
-async function sendPushToClass(className, changesCount) {
+async function sendPushToClass(className, changesCount, customMessage = null) {
   // Hole alle Devices dieser Klasse
   const deviceTokens = await kv.get(`class:${className}`);
   
@@ -207,23 +275,30 @@ async function sendPushToClass(className, changesCount) {
   
   for (const deviceToken of deviceTokens) {
     try {
-      await sendPushNotification(deviceToken, changesCount);
+      await sendPushNotification(deviceToken, changesCount, customMessage);
     } catch (error) {
       console.error(`❌ Push failed for ${deviceToken.substring(0, 10)}:`, error.message);
     }
   }
 }
 
-async function sendPushNotification(deviceToken, changesCount) {
+async function sendPushNotification(deviceToken, changesCount, customMessage = null) {
   // Erstelle APNs JWT Token
   const jwtToken = createAPNsJWT();
   
   // Payload
+  let body;
+  if (customMessage) {
+    body = customMessage;
+  } else {
+    body = `${changesCount} ${changesCount === 1 ? 'Stunde wurde' : 'Stunden wurden'} geändert oder ${changesCount === 1 ? 'fällt' : 'fallen'} aus.`;
+  }
+  
   const payload = {
     aps: {
       alert: {
         title: 'Stundenplan geändert! ⚠️',
-        body: `${changesCount} ${changesCount === 1 ? 'Stunde wurde' : 'Stunden wurden'} geändert oder ${changesCount === 1 ? 'fällt' : 'fallen'} aus.`,
+        body: body,
       },
       badge: changesCount,
       sound: 'default',
@@ -269,7 +344,6 @@ function createAPNsJWT() {
     kid: process.env.APNS_KEY_ID,
   };
   
-  // Private Key aus Environment
   const privateKey = process.env.APNS_PRIVATE_KEY;
   
   return jwt.sign(payload, privateKey, {
@@ -279,11 +353,9 @@ function createAPNsJWT() {
 }
 
 async function removeDeviceToken(deviceToken) {
-  // Hole Device Info
   const deviceData = await kv.get(`device:${deviceToken}`);
   
   if (deviceData) {
-    // Parse device data
     let device;
     if (typeof deviceData === 'string') {
       device = JSON.parse(deviceData);
@@ -291,13 +363,11 @@ async function removeDeviceToken(deviceToken) {
       device = deviceData;
     }
     
-    // Entferne aus Klassen-Liste
     const classTokens = await kv.get(`class:${device.className}`) || [];
     const filtered = classTokens.filter(t => t !== deviceToken);
     await kv.set(`class:${device.className}`, filtered);
   }
   
-  // Entferne Device
   await kv.del(`device:${deviceToken}`);
 }
 
@@ -315,19 +385,53 @@ function getWeekNumber(date) {
 
 function normalizeHTML(html) {
   let normalized = html;
+  
+  // ============================================================
+  // WICHTIG: Entferne alle sich ändernden Elemente
+  // ============================================================
+  
   const patterns = [
+    // Timestamps im Format "Stand: DD.MM.YYYY HH:MM"
     /Stand:\s*\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}/gi,
+    
+    // "generiert am DD.MM.YYYY"
     /generiert.*?\d{2}\.\d{2}\.\d{4}/gi,
+    
+    // Timestamp im Format "DD.MM.YYYY HH:MM:SS"
     /\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}:\d{2}/gi,
+    
+    // Periode mit Datum: "Periode8   2.2.2026 D (24) (6) - 8.2.2026 D (24) (6)   Zwischenplan"
+    /Periode\d+\s+\d{1,2}\.\d{1,2}\.\d{4}.*?Zwischenplan/gi,
+    
+    // Einzelne Datumsangaben im Format D.M.YYYY oder DD.MM.YYYY
+    /\d{1,2}\.\d{1,2}\.\d{4}/g,
+    
+    // Meta-Tag mit GENERATOR
+    /<meta name="GENERATOR"[^>]*>/gi,
+    
+    // Title-Tag mit Jahr
+    /<title>.*?<\/title>/gi,
   ];
+  
   for (const pattern of patterns) {
     normalized = normalized.replace(pattern, '');
   }
-  return normalized.replace(/\s+/g, ' ').trim();
+  
+  // Entferne mehrfache Leerzeichen und normalisiere
+  normalized = normalized.replace(/\s+/g, ' ').trim();
+  
+  return normalized;
 }
 
 function countRedEntries(html) {
-  const patterns = [/color="#FF0000"/gi, /color="red"/gi, /color:#FF0000/gi];
+  const patterns = [
+    /color="#FF0000"/gi, 
+    /color="red"/gi, 
+    /color:#FF0000/gi,
+    /color:\s*#FF0000/gi,
+    /color:\s*red/gi,
+  ];
+  
   let count = 0;
   for (const pattern of patterns) {
     const matches = html.match(pattern);
