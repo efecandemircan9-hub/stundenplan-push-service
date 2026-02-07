@@ -86,84 +86,118 @@ export default async function handler(req, res) {
 }
 
 async function sendPush(deviceToken) {
-  // JWT Token erstellen
-  const now = Math.floor(Date.now() / 1000);
-  
-  const payload = {
-    iss: process.env.APNS_TEAM_ID,
-    iat: now,
-  };
-  
-  const header = {
-    alg: 'ES256',
-    kid: process.env.APNS_KEY_ID,
-  };
-  
-  // Private Key formatieren
-  let privateKey = process.env.APNS_PRIVATE_KEY;
-  
-  if (!privateKey.includes('\n') && privateKey.includes('\\n')) {
-    privateKey = privateKey.replace(/\\n/g, '\n');
-  }
-  
-  if (!privateKey.includes('\n')) {
-    privateKey = privateKey
-      .replace('-----BEGIN PRIVATE KEY-----', '-----BEGIN PRIVATE KEY-----\n')
-      .replace('-----END PRIVATE KEY-----', '\n-----END PRIVATE KEY-----');
-  }
-  
-  const jwtToken = jwt.sign(payload, privateKey, {
-    algorithm: 'ES256',
-    header,
-  });
-  
-  // Push senden
-  const pushPayload = {
-    aps: {
-      alert: {
-        title: 'Test Push 🧪',
-        body: 'Wenn du das siehst, funktioniert Push! 🎉',
-      },
-      badge: 1,
-      sound: 'default',
-    },
-  };
-  
-  const response = await fetch(`${CONFIG.APNS_URL}/3/device/${deviceToken}`, {
-    method: 'POST',
-    headers: {
-      'authorization': `bearer ${jwtToken}`,
-      'apns-topic': CONFIG.APNS_TOPIC,
-      'apns-priority': '10',
-      'apns-push-type': 'alert',
-    },
-    body: JSON.stringify(pushPayload),
-  });
-  
-  const statusCode = response.status;
-  
-  if (statusCode === 200) {
-    console.log(`✅ Push sent successfully to ${deviceToken.substring(0, 10)}`);
-    return {
-      success: true,
-      statusCode: 200,
-      message: 'Push sent successfully',
-    };
-  } else {
-    const errorText = await response.text();
-    console.error(`❌ APNs error ${statusCode}: ${errorText}`);
+  try {
+    // JWT Token erstellen
+    const now = Math.floor(Date.now() / 1000);
     
-    let errorDetails = {};
-    try {
-      errorDetails = JSON.parse(errorText);
-    } catch {
-      errorDetails = { raw: errorText };
+    const payload = {
+      iss: process.env.APNS_TEAM_ID,
+      iat: now,
+    };
+    
+    const header = {
+      alg: 'ES256',
+      kid: process.env.APNS_KEY_ID,
+    };
+    
+    // Private Key formatieren
+    let privateKey = process.env.APNS_PRIVATE_KEY;
+    
+    console.log(`🔑 Original key length: ${privateKey?.length || 0}`);
+    console.log(`🔑 Has \\n: ${privateKey?.includes('\\n')}`);
+    console.log(`🔑 Has newline: ${privateKey?.includes('\n')}`);
+    
+    if (!privateKey) {
+      throw new Error('APNS_PRIVATE_KEY is not set');
     }
     
+    // Ersetze \n Strings mit echten Newlines
+    if (!privateKey.includes('\n') && privateKey.includes('\\n')) {
+      console.log('🔧 Converting \\n to newlines...');
+      privateKey = privateKey.replace(/\\n/g, '\n');
+    }
+    
+    // Falls immer noch keine Newlines, füge sie hinzu
+    if (!privateKey.includes('\n')) {
+      console.log('🔧 Adding newlines...');
+      privateKey = privateKey
+        .replace('-----BEGIN PRIVATE KEY-----', '-----BEGIN PRIVATE KEY-----\n')
+        .replace('-----END PRIVATE KEY-----', '\n-----END PRIVATE KEY-----');
+    }
+    
+    console.log(`✅ Formatted key has ${privateKey.split('\n').length} lines`);
+    
+    let jwtToken;
+    try {
+      jwtToken = jwt.sign(payload, privateKey, {
+        algorithm: 'ES256',
+        header,
+      });
+      console.log('✅ JWT token created');
+    } catch (jwtError) {
+      console.error('❌ JWT creation failed:', jwtError.message);
+      throw new Error(`JWT creation failed: ${jwtError.message}`);
+    }
+    
+    // Push senden
+    const pushPayload = {
+      aps: {
+        alert: {
+          title: 'Test Push 🧪',
+          body: 'Wenn du das siehst, funktioniert Push! 🎉',
+        },
+        badge: 1,
+        sound: 'default',
+      },
+    };
+    
+    const url = `${CONFIG.APNS_URL}/3/device/${deviceToken}`;
+    console.log(`📤 Sending to: ${url.substring(0, 80)}...`);
+    
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'authorization': `bearer ${jwtToken}`,
+        'apns-topic': CONFIG.APNS_TOPIC,
+        'apns-priority': '10',
+        'apns-push-type': 'alert',
+      },
+      body: JSON.stringify(pushPayload),
+    });
+    
+    const statusCode = response.status;
+    console.log(`📥 APNs Response: ${statusCode}`);
+    
+    if (statusCode === 200) {
+      console.log(`✅ Push sent successfully`);
+      return {
+        success: true,
+        statusCode: 200,
+        message: 'Push sent successfully',
+      };
+    } else {
+      const errorText = await response.text();
+      console.error(`❌ APNs error ${statusCode}: ${errorText}`);
+      
+      let errorDetails = {};
+      try {
+        errorDetails = JSON.parse(errorText);
+      } catch {
+        errorDetails = { raw: errorText };
+      }
+      
+      return {
+        success: false,
+        statusCode,
+        error: errorDetails,
+      };
+    }
+  } catch (error) {
+    console.error('❌ Push error:', error);
     return {
       success: false,
-      statusCode,
-      error: errorDetails,
+      error: error.message,
+      stack: error.stack,
     };
   }
 }
