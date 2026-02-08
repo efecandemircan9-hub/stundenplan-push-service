@@ -9,7 +9,7 @@ const CONFIG = {
   APNS_HOST: process.env.APNS_ENVIRONMENT === 'sandbox' 
     ? 'api.sandbox.push.apple.com'
     : 'api.push.apple.com',
-  APNS_TOPIC: 'nrw.bkb.stundenplan',
+  APNS_TOPIC: 'nrw.bkb',
 };
 
 export default async function handler(req, res) {
