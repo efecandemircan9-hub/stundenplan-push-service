@@ -1,8 +1,9 @@
 // api/check-stundenplan.js
-// Vercel Serverless Function - Verbesserte Version mit korrekter Timestamp-Normalisierung
+// Production version mit HTTP/2 für APNs
 
 import { kv } from '@vercel/kv';
 import jwt from 'jsonwebtoken';
+import http2 from 'http2';
 
 // ============================================================================
 // CONFIG
@@ -11,9 +12,9 @@ import jwt from 'jsonwebtoken';
 const CONFIG = {
   BKB_BASE_URL: 'https://stundenplan.bkb.nrw',
   MAPPING_URL: 'https://raw.githubusercontent.com/efecandemircan9-hub/BKBMapping/refs/heads/main/mapping.json',
-  APNS_URL: process.env.APNS_ENVIRONMENT === 'sandbox' 
-    ? 'https://api.sandbox.push.apple.com'
-    : 'https://api.push.apple.com',
+  APNS_HOST: process.env.APNS_ENVIRONMENT === 'sandbox' 
+    ? 'api.sandbox.push.apple.com'
+    : 'api.push.apple.com',
   APNS_TOPIC: 'nrw.bkb.stundenplan',
 };
 
@@ -22,7 +23,6 @@ const CONFIG = {
 // ============================================================================
 
 export default async function handler(req, res) {
-  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -34,17 +34,14 @@ export default async function handler(req, res) {
   try {
     console.log('🔍 Starting stundenplan check...');
     
-    // Lade alle registrierten Klassen
     const classes = await getRegisteredClasses();
     console.log(`📚 Found ${classes.length} classes`);
     
-    // Lade Mapping
     const mappingResponse = await fetch(CONFIG.MAPPING_URL);
     const mapping = await mappingResponse.json();
     
     const results = [];
     
-    // Prüfe jede Klasse
     for (const className of classes) {
       try {
         const result = await checkStundenplanForClass(className, mapping);
@@ -55,7 +52,6 @@ export default async function handler(req, res) {
       }
     }
     
-    // Update last check time
     await kv.set('meta:lastCheck', new Date().toISOString());
     
     return res.status(200).json({
@@ -89,11 +85,9 @@ async function checkStundenplanForClass(className, mapping) {
     throw new Error(`No slug found for ${className}`);
   }
   
-  // Aktuelle Woche
   const week = getWeekNumber(new Date());
   const weekFormatted = String(week).padStart(2, '0');
   
-  // Lade Stundenplan mit Basic Auth
   const url = `${CONFIG.BKB_BASE_URL}/schueler/${weekFormatted}/c/${slug}`;
   
   const username = 'schueler';
@@ -112,23 +106,18 @@ async function checkStundenplanForClass(className, mapping) {
   
   const htmlText = await response.text();
   
-  // ============================================================
-  // WICHTIG: Normalisiere HTML (entferne Timestamps & Datumsangaben)
-  // ============================================================
   const normalizedHTML = normalizeHTML(htmlText);
   const newHash = hashString(normalizedHTML);
   const newRedCount = countRedEntries(htmlText);
   
-  // Lade Cache
   const cacheKey = `cache:${className}:w${week}`;
   const cachedData = await kv.get(cacheKey);
   
   if (!cachedData) {
-    // Erster Check - speichere
     const cacheData = {
       hash: newHash,
       redCount: newRedCount,
-      normalizedHTML: normalizedHTML, // Speichere normalisiertes HTML
+      normalizedHTML: normalizedHTML,
       updatedAt: new Date().toISOString(),
     };
     
@@ -143,7 +132,6 @@ async function checkStundenplanForClass(className, mapping) {
     };
   }
   
-  // Parse cache data
   let cached;
   if (typeof cachedData === 'string') {
     cached = JSON.parse(cachedData);
@@ -157,9 +145,6 @@ async function checkStundenplanForClass(className, mapping) {
   console.log(`   Cached red:  ${cached.redCount || 0}`);
   console.log(`   New red:     ${newRedCount}`);
   
-  // ============================================================
-  // VERGLEICH: Hash unterschiedlich = Inhalt hat sich geändert
-  // ============================================================
   if (cached.hash === newHash) {
     console.log(`✅ ${className}: No changes`);
     return {
@@ -169,27 +154,19 @@ async function checkStundenplanForClass(className, mapping) {
     };
   }
   
-  // Hash unterschiedlich!
   console.log(`⚠️  ${className}: Hash changed!`);
-  
-  // ============================================================
-  // Prüfe ob es eine RELEVANTE Änderung ist
-  // ============================================================
   
   const oldRedCount = cached.redCount || 0;
   
-  // Fall 1: Mehr rote Einträge = Ausfälle/Änderungen
   if (newRedCount > oldRedCount) {
     const difference = newRedCount - oldRedCount;
-    const changes = Math.max(1, Math.floor(difference / 4)); // ~4 rote Tags pro Ausfall
+    const changes = Math.max(1, Math.floor(difference / 4));
     
     console.log(`🚨 ${className}: ${changes} new changes detected!`);
     console.log(`   Red count: ${oldRedCount} → ${newRedCount} (+${difference})`);
     
-    // Sende Push
     await sendPushToClass(className, changes);
     
-    // Update cache
     const newCacheData = {
       hash: newHash,
       redCount: newRedCount,
@@ -208,13 +185,11 @@ async function checkStundenplanForClass(className, mapping) {
     };
   }
   
-  // Fall 2: Weniger rote Einträge = Ausfälle wurden entfernt
   if (newRedCount < oldRedCount) {
     const difference = oldRedCount - newRedCount;
     
-    console.log(`ℹ️  ${className}: ${difference} red entries removed (cancellations cleared)`);
+    console.log(`ℹ️  ${className}: ${difference} red entries removed`);
     
-    // Update cache (ohne Push)
     const newCacheData = {
       hash: newHash,
       redCount: newRedCount,
@@ -233,14 +208,10 @@ async function checkStundenplanForClass(className, mapping) {
     };
   }
   
-  // Fall 3: Hash unterschiedlich, aber gleiche redCount
-  // = Nur Text/Raum/Lehrer geändert (auch wichtig!)
   console.log(`📝 ${className}: Content changed (same red count)`);
   
-  // Sende trotzdem Push (könnte Raumänderung sein!)
   await sendPushToClass(className, 1, 'Stundenplan aktualisiert');
   
-  // Update cache
   const newCacheData = {
     hash: newHash,
     redCount: newRedCount,
@@ -253,17 +224,16 @@ async function checkStundenplanForClass(className, mapping) {
   return {
     className,
     status: 'content_changed',
-    message: 'Stundenplan wurde aktualisiert (gleiche Anzahl Ausfälle)',
+    message: 'Stundenplan wurde aktualisiert',
     pushed: true,
   };
 }
 
 // ============================================================================
-// PUSH NOTIFICATIONS
+// PUSH NOTIFICATIONS (HTTP/2)
 // ============================================================================
 
 async function sendPushToClass(className, changesCount, customMessage = null) {
-  // Hole alle Devices dieser Klasse
   const deviceTokens = await kv.get(`class:${className}`);
   
   if (!deviceTokens || !Array.isArray(deviceTokens)) {
@@ -275,60 +245,100 @@ async function sendPushToClass(className, changesCount, customMessage = null) {
   
   for (const deviceToken of deviceTokens) {
     try {
-      await sendPushNotification(deviceToken, changesCount, customMessage);
+      await sendPushNotificationHTTP2(deviceToken, changesCount, customMessage);
     } catch (error) {
       console.error(`❌ Push failed for ${deviceToken.substring(0, 10)}:`, error.message);
     }
   }
 }
 
-async function sendPushNotification(deviceToken, changesCount, customMessage = null) {
-  // Erstelle APNs JWT Token
-  const jwtToken = createAPNsJWT();
-  
-  // Payload
-  let body;
-  if (customMessage) {
-    body = customMessage;
-  } else {
-    body = `${changesCount} ${changesCount === 1 ? 'Stunde wurde' : 'Stunden wurden'} geändert oder ${changesCount === 1 ? 'fällt' : 'fallen'} aus.`;
-  }
-  
-  const payload = {
-    aps: {
-      alert: {
-        title: 'Stundenplan geändert! ⚠️',
-        body: body,
-      },
-      badge: changesCount,
-      sound: 'default',
-    },
-  };
-  
-  // Sende an APNs
-  const response = await fetch(`${CONFIG.APNS_URL}/3/device/${deviceToken}`, {
-    method: 'POST',
-    headers: {
-      'authorization': `bearer ${jwtToken}`,
-      'apns-topic': CONFIG.APNS_TOPIC,
-      'apns-priority': '10',
-      'apns-push-type': 'alert',
-    },
-    body: JSON.stringify(payload),
-  });
-  
-  if (response.ok) {
-    console.log(`✅ Push sent to ${deviceToken.substring(0, 10)}`);
-  } else {
-    const errorText = await response.text();
-    console.error(`❌ APNs error: ${response.status} - ${errorText}`);
-    
-    // Bei ungültigem Token: entfernen
-    if (response.status === 410) {
-      await removeDeviceToken(deviceToken);
-      console.log(`🗑️ Removed invalid token`);
+async function sendPushNotificationHTTP2(deviceToken, changesCount, customMessage = null) {
+  return new Promise((resolve, reject) => {
+    try {
+      const jwtToken = createAPNsJWT();
+      
+      let body;
+      if (customMessage) {
+        body = customMessage;
+      } else {
+        body = `${changesCount} ${changesCount === 1 ? 'Stunde wurde' : 'Stunden wurden'} geändert oder ${changesCount === 1 ? 'fällt' : 'fallen'} aus.`;
+      }
+      
+      const payload = {
+        aps: {
+          alert: {
+            title: 'Stundenplan geändert! ⚠️',
+            body: body,
+          },
+          badge: changesCount,
+          sound: 'default',
+        },
+      };
+      
+      const payloadString = JSON.stringify(payload);
+      
+      const client = http2.connect(`https://${CONFIG.APNS_HOST}`);
+      
+      client.on('error', (err) => {
+        console.error('❌ HTTP/2 client error:', err);
+        client.close();
+        reject(err);
+      });
+      
+      const req = client.request({
+        ':method': 'POST',
+        ':scheme': 'https',
+        ':path': `/3/device/${deviceToken}`,
+        'authorization': `bearer ${jwtToken}`,
+        'apns-topic': CONFIG.APNS_TOPIC,
+        'apns-priority': '10',
+        'apns-push-type': 'alert',
+      });
+      
+      req.setEncoding('utf8');
+      
+      let responseData = '';
+      
+      req.on('response', (headers) => {
+        const statusCode = headers[':status'];
+        
+        req.on('data', (chunk) => {
+          responseData += chunk;
+        });
+        
+        req.on('end', () => {
+          client.close();
+          
+          if (statusCode === 200) {
+            console.log(`✅ Push sent to ${deviceToken.substring(0, 10)}`);
+            resolve();
+          } else {
+            console.error(`❌ APNs error: ${statusCode} - ${responseData}`);
+            
+            if (statusCode === 410) {
+              removeDeviceToken(deviceToken).catch(console.error);
+              console.log(`🗑️ Removed invalid token`);
+            }
+            
+            reject(new Error(`APNs error: ${statusCode}`));
+          }
+        });
+      });
+      
+      req.on('error', (err) => {
+        console.error('❌ Request error:', err);
+        client.close();
+        reject(err);
+      });
+      
+      req.write(payloadString);
+      req.end();
+      
+    } catch (error) {
+      console.error('❌ Push error:', error);
+      reject(error);
     }
-  }
+  });
 }
 
 function createAPNsJWT() {
@@ -344,7 +354,17 @@ function createAPNsJWT() {
     kid: process.env.APNS_KEY_ID,
   };
   
-  const privateKey = process.env.APNS_PRIVATE_KEY;
+  let privateKey = process.env.APNS_PRIVATE_KEY;
+  
+  if (!privateKey.includes('\n') && privateKey.includes('\\n')) {
+    privateKey = privateKey.replace(/\\n/g, '\n');
+  }
+  
+  if (!privateKey.includes('\n')) {
+    privateKey = privateKey
+      .replace('-----BEGIN PRIVATE KEY-----', '-----BEGIN PRIVATE KEY-----\n')
+      .replace('-----END PRIVATE KEY-----', '\n-----END PRIVATE KEY-----');
+  }
   
   return jwt.sign(payload, privateKey, {
     algorithm: 'ES256',
@@ -386,30 +406,13 @@ function getWeekNumber(date) {
 function normalizeHTML(html) {
   let normalized = html;
   
-  // ============================================================
-  // WICHTIG: Entferne alle sich ändernden Elemente
-  // ============================================================
-  
   const patterns = [
-    // Timestamps im Format "Stand: DD.MM.YYYY HH:MM"
     /Stand:\s*\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}/gi,
-    
-    // "generiert am DD.MM.YYYY"
     /generiert.*?\d{2}\.\d{2}\.\d{4}/gi,
-    
-    // Timestamp im Format "DD.MM.YYYY HH:MM:SS"
     /\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}:\d{2}/gi,
-    
-    // Periode mit Datum: "Periode8   2.2.2026 D (24) (6) - 8.2.2026 D (24) (6)   Zwischenplan"
     /Periode\d+\s+\d{1,2}\.\d{1,2}\.\d{4}.*?Zwischenplan/gi,
-    
-    // Einzelne Datumsangaben im Format D.M.YYYY oder DD.MM.YYYY
     /\d{1,2}\.\d{1,2}\.\d{4}/g,
-    
-    // Meta-Tag mit GENERATOR
     /<meta name="GENERATOR"[^>]*>/gi,
-    
-    // Title-Tag mit Jahr
     /<title>.*?<\/title>/gi,
   ];
   
@@ -417,10 +420,7 @@ function normalizeHTML(html) {
     normalized = normalized.replace(pattern, '');
   }
   
-  // Entferne mehrfache Leerzeichen und normalisiere
-  normalized = normalized.replace(/\s+/g, ' ').trim();
-  
-  return normalized;
+  return normalized.replace(/\s+/g, ' ').trim();
 }
 
 function countRedEntries(html) {
