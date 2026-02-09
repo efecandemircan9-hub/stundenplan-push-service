@@ -85,16 +85,20 @@ export default async function handler(req, res) {
   }
 }
 
-// Prüft ob ein Token noch gültig ist OHNE Push zu senden
+// Prüft ob ein Token noch gültig ist mit minimalem Silent Push
 async function checkTokenValidity(deviceToken) {
   return new Promise((resolve) => {
     try {
       const jwtToken = createAPNsJWT();
       
-      // WICHTIG: Wir senden einen EMPTY Push Body
-      // APNs wird die Validierung trotzdem durchführen
-      // Aber KEIN Push wird zugestellt (kein aps)
-      const payload = {};
+      // Minimaler gültiger Payload - Silent Push
+      // content-available weckt die App NICHT auf wenn sie gelöscht ist
+      // APNs gibt dann 410 zurück
+      const payload = {
+        aps: {
+          'content-available': 1
+        }
+      };
       
       const payloadString = JSON.stringify(payload);
       
@@ -136,7 +140,8 @@ async function checkTokenValidity(deviceToken) {
         ':path': `/3/device/${deviceToken}`,
         'authorization': `bearer ${jwtToken}`,
         'apns-topic': CONFIG.APNS_TOPIC,
-        'apns-priority': '1',  // Niedrigste Priority
+        'apns-priority': '5',  // Niedrige Priority für Background
+        'apns-push-type': 'background',  // Background Push
       });
       
       req.setEncoding('utf8');
