@@ -253,9 +253,13 @@ async function sendPushToClass(className, changesCount, customMessage = null) {
 }
 
 async function sendPushNotificationHTTP2(deviceToken, changesCount, customMessage = null) {
+  console.log(`🔔 Starting push for device: ${deviceToken.substring(0, 20)}...`);
+  
   return new Promise((resolve, reject) => {
     try {
+      console.log('🔑 Creating JWT...');
       const jwtToken = createAPNsJWT();
+      console.log('✅ JWT created');
       
       let body;
       if (customMessage) {
@@ -276,15 +280,18 @@ async function sendPushNotificationHTTP2(deviceToken, changesCount, customMessag
       };
       
       const payloadString = JSON.stringify(payload);
+      console.log(`📦 Payload created: ${payloadString.substring(0, 100)}...`);
       
+      console.log(`🌐 Connecting to: ${CONFIG.APNS_HOST}`);
       const client = http2.connect(`https://${CONFIG.APNS_HOST}`);
       
       client.on('error', (err) => {
-        console.error('❌ HTTP/2 client error:', err);
+        console.error('❌ HTTP/2 client error:', err.message);
         client.close();
         reject(err);
       });
       
+      console.log('📡 Creating request...');
       const req = client.request({
         ':method': 'POST',
         ':scheme': 'https',
@@ -301,6 +308,7 @@ async function sendPushNotificationHTTP2(deviceToken, changesCount, customMessag
       
       req.on('response', (headers) => {
         const statusCode = headers[':status'];
+        console.log(`📥 APNs Response: ${statusCode}`);
         
         req.on('data', (chunk) => {
           responseData += chunk;
@@ -310,14 +318,16 @@ async function sendPushNotificationHTTP2(deviceToken, changesCount, customMessag
           client.close();
           
           if (statusCode === 200) {
-            console.log(`✅ Push sent to ${deviceToken.substring(0, 10)}`);
+            console.log(`✅ Push sent successfully to ${deviceToken.substring(0, 10)}`);
             resolve();
           } else {
             console.error(`❌ APNs error: ${statusCode} - ${responseData}`);
             
             if (statusCode === 410) {
-              removeDeviceToken(deviceToken).catch(console.error);
-              console.log(`🗑️ Removed invalid token`);
+              console.log(`🗑️ Token is invalid (app deleted) - removing from system`);
+              removeDeviceToken(deviceToken).catch(err => {
+                console.error('Failed to remove device token:', err);
+              });
             }
             
             reject(new Error(`APNs error: ${statusCode}`));
@@ -326,16 +336,19 @@ async function sendPushNotificationHTTP2(deviceToken, changesCount, customMessag
       });
       
       req.on('error', (err) => {
-        console.error('❌ Request error:', err);
+        console.error('❌ Request error:', err.message);
         client.close();
         reject(err);
       });
       
+      console.log('📤 Sending payload...');
       req.write(payloadString);
       req.end();
+      console.log('✅ Payload sent, waiting for response...');
       
     } catch (error) {
-      console.error('❌ Push error:', error);
+      console.error('❌ Push error:', error.message);
+      console.error('   Stack:', error.stack);
       reject(error);
     }
   });
