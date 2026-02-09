@@ -1,4 +1,4 @@
-// api/cleanup-tokens.js
+// api/cleanup-tokens.js y
 // Prüft alle Device Tokens und entfernt ungültige (OHNE Push zu senden)
 
 import { kv } from '@vercel/kv';
