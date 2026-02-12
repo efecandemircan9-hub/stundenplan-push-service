@@ -31,6 +31,8 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
   
+  const startTime = Date.now(); // Für Logging
+  
   try {
     console.log('🔍 Starting stundenplan check...');
     
@@ -54,6 +56,23 @@ export default async function handler(req, res) {
     
     await kv.set('meta:lastCheck', new Date().toISOString());
     
+    // Berechne Statistiken für Log
+    const totalChanges = results.filter(r => r.status === 'changes_detected')
+      .reduce((sum, r) => sum + (r.changes || 0), 0);
+    const totalPushesSent = results.filter(r => 
+      (r.status === 'changes_detected' || r.status === 'content_changed') && r.pushed
+    ).length;
+    
+    // Speichere Log
+    await saveCheckLog({
+      status: 'completed',
+      duration: Date.now() - startTime,
+      classes: classes.length,
+      results: results,
+      totalChanges: totalChanges,
+      totalPushesSent: totalPushesSent,
+    });
+    
     return res.status(200).json({
       success: true,
       timestamp: new Date().toISOString(),
@@ -63,6 +82,14 @@ export default async function handler(req, res) {
     
   } catch (error) {
     console.error('❌ Error:', error);
+    
+    // Speichere Error-Log
+    await saveCheckLog({
+      status: 'error',
+      error: error.message,
+      duration: Date.now() - startTime,
+    });
+    
     return res.status(500).json({
       success: false,
       error: error.message,
@@ -460,4 +487,28 @@ function hashString(str) {
     hash = hash & hash;
   }
   return hash;
+}
+
+// ============================================================================
+// LOGGING
+// ============================================================================
+
+async function saveCheckLog(checkData) {
+  try {
+    const logKey = `log:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`;
+    
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      type: 'stundenplan_check',
+      ...checkData,
+    };
+    
+    // TTL: 31 Tage (in Sekunden)
+    await kv.set(logKey, logEntry, { ex: 31 * 24 * 60 * 60 });
+    
+    console.log(`📝 Log saved: ${logKey}`);
+  } catch (error) {
+    console.error('❌ Failed to save log:', error.message);
+    // Nicht kritisch - System läuft weiter
+  }
 }
