@@ -169,9 +169,11 @@ function countChanges(html) {
     const fach   = tds[0]?.text ?? '';
     const lehrer = tds[tds.length - 1]?.text ?? '';
 
-    // AUSFALL:    Fach UND Lehrer sind beide "---"
-    // VERTRETUNG: nur eines davon (oder keines) ist "---"
-    if (fach === '---' && lehrer === '---') {
+    // Untis kodiert leere Felder als '---' oder '+---+' (je nach Version)
+    // AUSFALL:    Fach UND Lehrer sind beide leer (--- oder +---+)
+    // VERTRETUNG: nur eines davon leer, oder keines
+    const isEmpty = t => t === '---' || t === '+---+';
+    if (isEmpty(fach) && isEmpty(lehrer)) {
       cancellations++;
     } else {
       substitutions++;
