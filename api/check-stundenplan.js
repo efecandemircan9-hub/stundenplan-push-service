@@ -28,9 +28,7 @@ export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
+  if (req.method === 'OPTIONS') return res.status(200).end();
 
   const startTime = Date.now();
 
@@ -49,7 +47,6 @@ export default async function handler(req, res) {
     const mapping = await mappingResponse.json();
 
     const results = [];
-
     for (const className of classes) {
       try {
         const result = await checkStundenplanForClass(className, mapping);
@@ -64,7 +61,7 @@ export default async function handler(req, res) {
 
     const totalChanges = results
       .filter(r => r.status === 'changes_detected')
-      .reduce((sum, r) => sum + (r.changes || 0), 0);
+      .reduce((sum, r) => sum + (r.newChanges || 0), 0);
     const totalPushesSent = results.filter(r => r.pushed).length;
 
     await saveCheckLog({
@@ -101,100 +98,86 @@ async function getRegisteredClasses() {
 
 async function checkStundenplanForClass(className, mapping) {
   const slug = mapping[className];
-  if (!slug) {
-    throw new Error(`No slug found for ${className}`);
-  }
+  if (!slug) throw new Error(`No slug found for ${className}`);
 
   const now = new Date();
   const week = getWeekNumber(now);
-  const year = now.getFullYear(); // ← Bug-Fix: Jahr im Cache-Key
+  const year = now.getFullYear();
   const weekFormatted = String(week).padStart(2, '0');
 
   const url = `${CONFIG.BKB_BASE_URL}/schueler/${weekFormatted}/c/${slug}`;
   const basicAuth = 'Basic ' + btoa('schueler:stundenplan');
 
   const response = await fetch(url, { headers: { 'Authorization': basicAuth } });
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch stundenplan: ${response.status}`);
-  }
+  if (!response.ok) throw new Error(`Failed to fetch stundenplan: ${response.status}`);
 
   const htmlText = await response.text();
   const normalizedHTML = normalizeHTML(htmlText);
-  const newHash = hashString(normalizedHTML); // SHA-256
-  const newChanges = parseZwischenplanChanges(htmlText); // ← korrekte Änderungserkennung
-  const newChangeCount = newChanges.length;
+  const newHash = hashString(normalizedHTML);
+  const { substitutions, cancellations, total: newChangeCount } = countChanges(htmlText);
 
-  // Bug-Fix: Jahr im Key verhindert Jahreswechsel-Fehler
+  // Jahr im Key verhindert Jahreswechsel-Bug
   const cacheKey = `cache:${className}:${year}:w${week}`;
-  const cachedData = await kv.get(cacheKey);
+  const cachedRaw = await kv.get(cacheKey);
 
-  if (!cachedData) {
+  if (!cachedRaw) {
     await kv.set(cacheKey, {
       hash: newHash,
       changeCount: newChangeCount,
       updatedAt: new Date().toISOString(),
     });
-
-    console.log(`✅ ${className}: First check - cached (${newChangeCount} changes in Zwischenplan)`);
+    console.log(`✅ ${className}: First check – cached (${substitutions} Vertretungen, ${cancellations} Ausfälle)`);
     return { className, status: 'first_check', changeCount: newChangeCount };
   }
 
-  const cached = typeof cachedData === 'string' ? JSON.parse(cachedData) : cachedData;
+  const cached = typeof cachedRaw === 'string' ? JSON.parse(cachedRaw) : cachedRaw;
+  const oldChangeCount = cached.changeCount ?? 0;
 
-  console.log(`🔍 ${className}: hash old=${cached.hash} new=${newHash}`);
-  console.log(`   Zwischenplan: cached=${cached.changeCount ?? 0} new=${newChangeCount}`);
+  console.log(`🔍 ${className}: hash ${cached.hash === newHash ? 'SAME' : 'CHANGED'} | changes ${oldChangeCount}→${newChangeCount}`);
 
-  // Hash unverändert → definitiv keine Änderung
+  // Hash identisch = absolut keine Änderung
   if (cached.hash === newHash) {
-    console.log(`✅ ${className}: No changes`);
     return { className, status: 'no_changes' };
   }
 
-  console.log(`⚠️  ${className}: Hash changed!`);
-
-  const oldChangeCount = cached.changeCount ?? 0;
-
-  // Cache immer aktualisieren wenn sich der Hash geändert hat
-  const newCacheData = {
+  // Cache immer aktualisieren wenn Hash geändert
+  await kv.set(cacheKey, {
     hash: newHash,
     changeCount: newChangeCount,
     updatedAt: new Date().toISOString(),
-  };
-  await kv.set(cacheKey, newCacheData);
+  });
 
-  // Neue Änderungen hinzugekommen
+  // Mehr Änderungen als zuvor → Push
   if (newChangeCount > oldChangeCount) {
     const diff = newChangeCount - oldChangeCount;
-    console.log(`🚨 ${className}: ${diff} new change(s) detected! (${oldChangeCount} → ${newChangeCount})`);
-
-    const pushMessage = buildPushMessage(newChanges, oldChangeCount);
-    await sendPushToClass(className, diff, pushMessage);
-
+    console.log(`🚨 ${className}: ${diff} neue Änderung(en) (${substitutions} Vertretungen, ${cancellations} Ausfälle)`);
+    const msg = buildPushMessage(substitutions, cancellations, diff);
+    await sendPushToClass(className, diff, msg);
     return {
       className,
       status: 'changes_detected',
-      changes: diff,
-      changeCountChange: `${oldChangeCount} → ${newChangeCount}`,
+      newChanges: diff,
+      substitutions,
+      cancellations,
+      changeCount: `${oldChangeCount}→${newChangeCount}`,
       pushed: true,
     };
   }
 
-  // Änderungen wurden weniger (Ausfälle entfernt) → kein Push
+  // Weniger Änderungen (Ausfälle behoben) → kein Push
   if (newChangeCount < oldChangeCount) {
-    console.log(`ℹ️  ${className}: Changes reduced (${oldChangeCount} → ${newChangeCount}) - no push`);
+    console.log(`ℹ️  ${className}: Änderungen reduziert (${oldChangeCount}→${newChangeCount})`);
     return {
       className,
       status: 'changes_cleared',
-      changeCountChange: `${oldChangeCount} → ${newChangeCount}`,
+      changeCount: `${oldChangeCount}→${newChangeCount}`,
       pushed: false,
     };
   }
 
-  // Hash geändert, aber gleiche Anzahl Änderungen → Vertretung/Raum wurde getauscht
-  console.log(`📝 ${className}: Content changed, same change count (${newChangeCount})`);
-  await sendPushToClass(className, newChangeCount || 1, 'Stundenplanänderung: Details wurden aktualisiert.');
-
+  // Gleiche Anzahl aber anderer Hash → Inhalt getauscht (z.B. anderer Vertreter)
+  console.log(`📝 ${className}: Inhalt geändert, gleiche Anzahl (${newChangeCount})`);
+  await sendPushToClass(className, newChangeCount || 1, 'Stundenplanänderung: Einträge wurden aktualisiert.');
   return {
     className,
     status: 'changes_updated',
@@ -204,135 +187,80 @@ async function checkStundenplanForClass(className, mapping) {
 }
 
 // ============================================================================
-// ZWISCHENPLAN PARSING
+// CHANGE DETECTION
+//
+// Die Zwischenplan-Tabelle (bgcolor="#E7E7E7") enthält NUR dauerhafte
+// Gruppendefinitionen mit Schulwoche "1-7,10-17,20-31,34-47" (= ganzes Jahr).
+// Sie zeigt KEINE aktuellen wöchentlichen Änderungen → wird ignoriert.
+//
+// Der einzig zuverlässige Indikator: rote Font-Tags im Hauptgitter.
+//
+// Pro geänderter Stunde im Grid:
+//   Vertretung: <font red>Fach</font><font red>Nr)</font><font red>Raum</font><font red>Lehrer</font>
+//   Ausfall:    <font red>---</font> <font red>Nr)</font><font red>Raum</font><font red>---</font>
+//
+// Jede Stunde erscheint wegen rowspan DOPPELT im HTML.
+// → Vertretungen = Anzahl eindeutiger Nr-Referenzen (Set)
+// → Ausfälle     = count('---') / 2
 // ============================================================================
 
-/**
- * Parsed die graue Zwischenplan-Tabelle (bgcolor="#E7E7E7").
- * Gibt echte Änderungszeilen zurück (Vertretungen, Ausfälle, Raumwechsel).
- *
- * Struktur einer Zeile:
- *   Nr. | Le./Fa./Rm.             | Klasse | Zeit | Schulwoche | ...
- *   1)  | Vinn(Lück), Eng, A 203  | 1G23B  |      | 1-7,...    |
- *
- * Cancelled-Stunden werden im Stundenplan-Grid mit "+---+" (rot) markiert,
- * haben aber keinen Nr.-Eintrag in der Zwischenplan-Tabelle, sondern werden
- * direkt im Timetable-Grid rot eingefärbt.
- */
-function parseZwischenplanChanges(html) {
-  // Erste graue Tabelle = Änderungstabelle (zweite = Legende)
-  const tableMatch = html.match(
-    /<TABLE[^>]*bgcolor=["']#E7E7E7["'][^>]*>([\s\S]*?)<\/TABLE>/i
-  );
-  if (!tableMatch) return [];
+function countChanges(html) {
+  const redTexts = (
+    html.match(/<font[^>]*color=["']?#?FF0000["']?[^>]*>([\s\S]*?)<\/font>/gi) || []
+  ).map(tag => tag.replace(/<[^>]+>/g, '').trim());
 
-  const rows = tableMatch[1].match(/<TR>([\s\S]*?)<\/TR>/gi) || [];
-  const changes = [];
+  // Eindeutige Nr-Referenzen (z.B. "4)", "5)") = Vertretungen
+  const nrRefs = new Set(redTexts.filter(t => /^\d+\)$/.test(t)));
+  const substitutions = nrRefs.size;
 
-  // Zeile 0 = Header (Nr., Le.,Fa.,Rm., Kla., ...) → überspringen
-  for (const row of rows.slice(1)) {
-    const cells = (row.match(/<TD[^>]*>([\s\S]*?)<\/TD>/gi) || [])
-      .map(c => c.replace(/<[^>]+>/g, '').replace(/&nbsp;/g, '').trim());
+  // "---" = Ausfall-Marker, wegen rowspan doppelt → halbieren
+  const cancellations = Math.floor(redTexts.filter(t => t === '---').length / 2);
 
-    // Echte Änderungszeilen beginnen mit "1)", "2)", etc.
-    if (cells[0] && /^\d+\)$/.test(cells[0].trim())) {
-      changes.push({
-        nr: cells[0].trim(),
-        info: cells[1] || '',   // z.B. "Vinn(Lück), Eng(Physi), A 203"
-        className: cells[2] || '',
-        week: cells[3] || '',
-      });
-    }
-  }
-
-  // Zusätzlich: Ausgefallene Stunden (+---+) aus dem Hauptgitter zählen,
-  // die NICHT in der Zwischenplan-Tabelle erscheinen.
-  const cancelledInGrid = (html.match(
-    /<font[^>]*color=["']?#FF0000["']?[^>]*>\s*\+---\+\s*<\/font>/gi
-  ) || []);
-  // Da jede Stunde wegen rowspan doppelt erscheint, durch 2 teilen
-  const uniqueCancellations = Math.ceil(cancelledInGrid.length / 2);
-
-  for (let i = 0; i < uniqueCancellations; i++) {
-    changes.push({ nr: `cancelled_${i}`, info: 'Ausfall', className: '', week: '' });
-  }
-
-  return changes;
+  return { substitutions, cancellations, total: substitutions + cancellations };
 }
 
-/**
- * Baut eine sinnvolle Push-Nachricht aus den Änderungen.
- */
-function buildPushMessage(changes, previousCount) {
-  const newOnes = changes.slice(previousCount);
-  const subjects = [...new Set(
-    newOnes
-      .map(c => {
-        const match = c.info.match(/,\s*([A-Za-zÄÖÜäöüß\-]+)\s*[,(]/);
-        return match ? match[1] : null;
-      })
-      .filter(Boolean)
-  )];
-
-  if (subjects.length > 0 && subjects.length <= 3) {
-    return `Neue Änderung: ${subjects.join(', ')}`;
-  }
-
-  const n = newOnes.length;
-  return `${n} ${n === 1 ? 'neue Änderung' : 'neue Änderungen'} im Stundenplan.`;
+function buildPushMessage(substitutions, cancellations, diff) {
+  const parts = [];
+  if (cancellations > 0) parts.push(`${cancellations} ${cancellations === 1 ? 'Ausfall' : 'Ausfälle'}`);
+  if (substitutions > 0) parts.push(`${substitutions} ${substitutions === 1 ? 'Vertretung' : 'Vertretungen'}`);
+  if (parts.length > 0) return parts.join(', ') + ' im Stundenplan.';
+  return `${diff} ${diff === 1 ? 'neue Änderung' : 'neue Änderungen'} im Stundenplan.`;
 }
 
 // ============================================================================
 // PUSH NOTIFICATIONS (HTTP/2)
 // ============================================================================
 
-async function sendPushToClass(className, changesCount, customMessage = null) {
+async function sendPushToClass(className, changesCount, message) {
   const deviceTokens = await kv.get(`class:${className}`);
-
   if (!deviceTokens || !Array.isArray(deviceTokens) || deviceTokens.length === 0) {
     console.log(`⚠️ No devices for ${className}`);
     return;
   }
-
-  console.log(`📤 Sending push to ${deviceTokens.length} devices for ${className}`);
-
+  console.log(`📤 Sending push to ${deviceTokens.length} device(s) for ${className}`);
   for (const deviceToken of deviceTokens) {
     try {
-      await sendPushNotificationHTTP2(deviceToken, changesCount, customMessage);
+      await sendPushNotificationHTTP2(deviceToken, changesCount, message);
     } catch (error) {
       console.error(`❌ Push failed for ${deviceToken.substring(0, 10)}:`, error.message);
     }
   }
 }
 
-async function sendPushNotificationHTTP2(deviceToken, changesCount, customMessage = null) {
-  console.log(`🔔 Push for device: ${deviceToken.substring(0, 20)}...`);
-
+async function sendPushNotificationHTTP2(deviceToken, changesCount, message) {
   return new Promise((resolve, reject) => {
     try {
       const jwtToken = createAPNsJWT();
-
-      const body = customMessage
-        ?? `${changesCount} ${changesCount === 1 ? 'neue Änderung' : 'neue Änderungen'} im Stundenplan.`;
-
-      const payload = {
+      const payload = JSON.stringify({
         aps: {
-          alert: {
-            title: 'Stundenplan geändert! ⚠️',
-            body,
-          },
+          alert: { title: 'Stundenplan geändert! ⚠️', body: message },
           badge: changesCount,
           sound: 'default',
         },
-      };
-
-      const payloadString = JSON.stringify(payload);
-      const client = http2.connect(`https://${CONFIG.APNS_HOST}`);
-
-      client.on('error', (err) => {
-        client.close();
-        reject(err);
       });
+
+      const client = http2.connect(`https://${CONFIG.APNS_HOST}`);
+      client.on('error', err => { client.close(); reject(err); });
 
       const req = client.request({
         ':method': 'POST',
@@ -346,76 +274,46 @@ async function sendPushNotificationHTTP2(deviceToken, changesCount, customMessag
 
       req.setEncoding('utf8');
       let responseData = '';
-
-      req.on('response', (headers) => {
+      req.on('response', headers => {
         const statusCode = headers[':status'];
-        console.log(`📥 APNs Response: ${statusCode}`);
-
         req.on('data', chunk => { responseData += chunk; });
-
         req.on('end', () => {
           client.close();
-
           if (statusCode === 200) {
             console.log(`✅ Push sent to ${deviceToken.substring(0, 10)}`);
             resolve();
           } else {
-            console.error(`❌ APNs error: ${statusCode} - ${responseData}`);
-
-            // Token abgelaufen oder App gelöscht
-            if (statusCode === 410) {
-              removeDeviceToken(deviceToken).catch(err =>
-                console.error('Failed to remove device token:', err)
-              );
-            }
-
-            // BadDeviceToken → ebenfalls entfernen
+            if (statusCode === 410) removeDeviceToken(deviceToken).catch(console.error);
             if (statusCode === 400) {
               try {
-                const body = JSON.parse(responseData);
-                if (body.reason === 'BadDeviceToken') {
-                  removeDeviceToken(deviceToken).catch(err =>
-                    console.error('Failed to remove bad device token:', err)
-                  );
-                }
+                if (JSON.parse(responseData).reason === 'BadDeviceToken')
+                  removeDeviceToken(deviceToken).catch(console.error);
               } catch {}
             }
-
-            reject(new Error(`APNs error: ${statusCode}`));
+            reject(new Error(`APNs error: ${statusCode} – ${responseData}`));
           }
         });
       });
-
-      req.on('error', (err) => {
-        client.close();
-        reject(err);
-      });
-
-      req.write(payloadString);
+      req.on('error', err => { client.close(); reject(err); });
+      req.write(payload);
       req.end();
-
     } catch (error) {
-      console.error('❌ Push error:', error.message);
       reject(error);
     }
   });
 }
 
 function createAPNsJWT() {
-  const now = Math.floor(Date.now() / 1000);
-
   let privateKey = process.env.APNS_PRIVATE_KEY;
-  if (!privateKey.includes('\n') && privateKey.includes('\\n')) {
+  if (!privateKey.includes('\n') && privateKey.includes('\\n'))
     privateKey = privateKey.replace(/\\n/g, '\n');
-  }
   if (!privateKey.includes('\n')) {
     privateKey = privateKey
       .replace('-----BEGIN PRIVATE KEY-----', '-----BEGIN PRIVATE KEY-----\n')
       .replace('-----END PRIVATE KEY-----', '\n-----END PRIVATE KEY-----');
   }
-
   return jwt.sign(
-    { iss: process.env.APNS_TEAM_ID, iat: now },
+    { iss: process.env.APNS_TEAM_ID, iat: Math.floor(Date.now() / 1000) },
     privateKey,
     { algorithm: 'ES256', header: { alg: 'ES256', kid: process.env.APNS_KEY_ID } }
   );
@@ -434,7 +332,7 @@ async function removeDeviceToken(deviceToken) {
     }
   }
   await kv.del(`device:${deviceToken}`);
-  console.log(`🗑️ Removed device token: ${deviceToken.substring(0, 10)}...`);
+  console.log(`🗑️ Removed token: ${deviceToken.substring(0, 10)}...`);
 }
 
 // ============================================================================
@@ -450,31 +348,20 @@ function getWeekNumber(date) {
 }
 
 function normalizeHTML(html) {
-  let normalized = html;
-
+  let n = html;
   const patterns = [
-    // Timestamps & Datumsangaben die sich ändern ohne inhaltliche Bedeutung
     /Stand:\s*\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}/gi,
     /generiert.*?\d{2}\.\d{2}\.\d{4}/gi,
     /\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}:\d{2}/gi,
-    // Perioden-Zeile am Ende enthält Datum → komplett entfernen
     /Periode\d+\s+\d{1,2}\.\d{1,2}\.\d{4}.*?(?:Zwischenplan|$)/gi,
-    // Einzelne Datumsangaben in Spaltenkopfzeilen (Mo 16.2. etc.)
     /\d{1,2}\.\d{1,2}\./g,
     /<meta name="GENERATOR"[^>]*>/gi,
     /<title>.*?<\/title>/gi,
   ];
-
-  for (const pattern of patterns) {
-    normalized = normalized.replace(pattern, '');
-  }
-
-  return normalized.replace(/\s+/g, ' ').trim();
+  for (const p of patterns) n = n.replace(p, '');
+  return n.replace(/\s+/g, ' ').trim();
 }
 
-/**
- * SHA-256 Hash (kein 32-bit Overflow → keine Kollisionen).
- */
 function hashString(str) {
   return crypto.createHash('sha256').update(str, 'utf8').digest('hex');
 }
@@ -483,15 +370,14 @@ function hashString(str) {
 // LOGGING
 // ============================================================================
 
-async function saveCheckLog(checkData) {
+async function saveCheckLog(data) {
   try {
-    const logKey = `log:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`;
+    const key = `log:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`;
     await kv.set(
-      logKey,
-      { timestamp: new Date().toISOString(), type: 'stundenplan_check', ...checkData },
+      key,
+      { timestamp: new Date().toISOString(), type: 'stundenplan_check', ...data },
       { ex: 31 * 24 * 60 * 60 }
     );
-    console.log(`📝 Log saved: ${logKey}`);
   } catch (error) {
     console.error('❌ Failed to save log:', error.message);
   }
