@@ -49,8 +49,8 @@ async function diagnoseClass(className, mapping, week, year) {
   const slug = mapping[className];
   if (!slug) return { className, status: 'no_slug', wouldPush: false };
 
-  let htmlText;
   const url = `${CONFIG.BKB_BASE_URL}/schueler/${String(week).padStart(2, '0')}/c/${slug}`;
+  let htmlText;
   try {
     const r = await fetch(url, { headers: { 'Authorization': 'Basic ' + btoa('schueler:stundenplan') } });
     if (!r.ok) return { className, status: 'fetch_error', error: `HTTP ${r.status}`, url, wouldPush: false };
@@ -133,26 +133,39 @@ function formatAsText(results, summary, week, year) {
 // ============================================================================
 
 function countChanges(html) {
-  const lessonBlocks = [...html.matchAll(
-    /<TD colspan=12 rowspan=\d+[^>]*><TABLE><TR>([\s\S]*?)<\/TR><\/TABLE><\/TD>/gi
-  )].map(m => m[1]);
+  const blockRegex = /<TD colspan=12 rowspan=\d+[^>]*><TABLE><TR>([\s\S]*?)<\/TR><\/TABLE><\/TD>/gi;
+  const lessonBlocks = [...html.matchAll(blockRegex)].map(m => m[1]);
 
-  let cancellations = 0, substitutions = 0;
+  let cancellations = 0;
+  let substitutions = 0;
   const seenNrs = new Set();
 
   for (const block of lessonBlocks) {
-    const tds = [...block.matchAll(/<TD[^>]*>([\s\S]*?)<\/TD>/gi)].map(m => {
-      const f = m[1].match(/<font([^>]*)>([\s\S]*?)<\/font>/i);
-      if (!f) return null;
-      return { text: f[2].replace(/<[^>]+>/g, '').trim(), red: /FF0000/i.test(f[1]) };
+    const tdRegex = /<TD[^>]*>([\s\S]*?)<\/TD>/gi;
+    const tds = [...block.matchAll(tdRegex)].map(m => {
+      const fontMatch = m[1].match(/<font([^>]*)>([\s\S]*?)<\/font>/i);
+      if (!fontMatch) return null;
+      return {
+        text: fontMatch[2].replace(/<[^>]+>/g, '').trim(),
+        red: /FF0000/i.test(fontMatch[1]),
+      };
     }).filter(Boolean);
 
     if (!tds.some(td => td.red)) continue;
-    const fach = tds[0]?.text ?? '';
-    const nr = tds.find(td => /^\d+\)$/.test(td.text))?.text ?? fach;
+
+    const nrRegex = /^\d+\)$/;
+    const nr = tds.find(td => nrRegex.test(td.text))?.text ?? tds[0]?.text;
     if (seenNrs.has(nr)) continue;
     seenNrs.add(nr);
-    fach === '---' ? cancellations++ : substitutions++;
+
+    const fach   = tds[0]?.text ?? '';
+    const lehrer = tds[tds.length - 1]?.text ?? '';
+
+    if (fach === '---' && lehrer === '---') {
+      cancellations++;
+    } else {
+      substitutions++;
+    }
   }
 
   return { cancellations, substitutions, total: cancellations + substitutions };
