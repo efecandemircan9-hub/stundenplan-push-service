@@ -45,7 +45,6 @@ export default async function handler(req, res) {
     }
 
     await kv.set('meta:lastCheck', new Date().toISOString());
-
     const totalChanges = results.filter(r => r.status === 'changes_detected').reduce((s, r) => s + (r.newChanges || 0), 0);
     const totalPushesSent = results.filter(r => r.pushed).length;
 
@@ -95,11 +94,8 @@ async function checkStundenplanForClass(className, mapping) {
 
   console.log(`🔍 ${className}: hash ${cached.hash === newHash ? 'SAME' : 'CHANGED'} | changes ${oldChangeCount}→${newChangeCount} (${cancellations} Ausfälle, ${substitutions} Vertretungen)`);
 
-  if (cached.hash === newHash) {
-    return { className, status: 'no_changes' };
-  }
+  if (cached.hash === newHash) return { className, status: 'no_changes' };
 
-  // Cache immer aktualisieren
   await kv.set(cacheKey, { hash: newHash, changeCount: newChangeCount, updatedAt: new Date().toISOString() });
 
   if (newChangeCount > oldChangeCount) {
@@ -113,7 +109,6 @@ async function checkStundenplanForClass(className, mapping) {
     return { className, status: 'changes_cleared', changeCount: `${oldChangeCount}→${newChangeCount}`, pushed: false };
   }
 
-  // Gleiche Anzahl, anderer Hash → Einträge wurden getauscht (z.B. anderer Vertreter)
   await sendPushToClass(className, newChangeCount || 1, 'Stundenplanänderung: Einträge wurden aktualisiert.');
   return { className, status: 'changes_updated', changeCount: newChangeCount, pushed: true };
 }
@@ -121,42 +116,66 @@ async function checkStundenplanForClass(className, mapping) {
 // ============================================================================
 // CHANGE DETECTION
 //
-// Jede Stunde = TD(colspan=12, rowspan=2) > TABLE > TR > 4x TD:
-//   TD1: Fach    TD2: Nr-Ref    TD3: Raum    TD4: Lehrer
+// Jede Stunde = TD(colspan=12, rowspan=2) > TABLE > TR > TDs:
+//   TD[0]:    Fach    (z.B. "Deu" oder "---")
+//   TD[1]:    Nr-Ref  (z.B. "4)") — optional
+//   TD[2]:    Raum    (z.B. "B 303")
+//   TD[last]: Lehrer  (z.B. "Berg" oder "---")
 //
-// Änderung erkennbar an roten Font-Tags (color=#FF0000):
-//   AUSFALL:    TD1 = "---" (rot)       → Stunde fällt komplett aus
-//   VERTRETUNG: TD1 = Fachname (rot)    → Lehrer/Raum geändert, Stunde findet statt
+// Geänderte Felder sind rot (color="#FF0000").
 //
-// Freistunden (leere TD ohne Font) werden korrekt ignoriert.
-// Rowspan-Duplikate werden über Nr-Referenz-Set dedupliziert.
+// Klassifizierung:
+//   AUSFALL:    Fach === "---" UND Lehrer === "---"  (niemand übernimmt)
+//   VERTRETUNG: alles andere mit roten Tags           (jemand/etwas ist anders)
+//
+// Beispiele:
+//   +---+  4)  B303  Berg  → Vertretung (Berg übernimmt, Fach egal)
+//   +---+  4)  B303  ---   → Ausfall    (Fach weg, kein Lehrer)
+//   Deu    4)  B303  Berg  → Vertretung (Berg unterrichtet Deu)
+//   Deu    4)  B303  ---   → Ausfall    (Deu fällt aus, kein Lehrer)
+//
+// Freistunden (leere TDs ohne Font-Tag) → korrekt ignoriert
+// Rowspan-Duplikate → dedupliziert via Nr-Ref Set
 // ============================================================================
 
 function countChanges(html) {
-  const lessonBlocks = [...html.matchAll(
-    /<TD colspan=12 rowspan=\d+[^>]*><TABLE><TR>([\s\S]*?)<\/TR><\/TABLE><\/TD>/gi
-  )].map(m => m[1]);
+  const blockRegex = /<TD colspan=12 rowspan=\d+[^>]*><TABLE><TR>([\s\S]*?)<\/TR><\/TABLE><\/TD>/gi;
+  const lessonBlocks = [...html.matchAll(blockRegex)].map(m => m[1]);
 
   let cancellations = 0;
   let substitutions = 0;
   const seenNrs = new Set();
 
   for (const block of lessonBlocks) {
-    const tds = [...block.matchAll(/<TD[^>]*>([\s\S]*?)<\/TD>/gi)].map(m => {
-      const f = m[1].match(/<font([^>]*)>([\s\S]*?)<\/font>/i);
-      if (!f) return null;
-      return { text: f[2].replace(/<[^>]+>/g, '').trim(), red: /FF0000/i.test(f[1]) };
+    const tdRegex = /<TD[^>]*>([\s\S]*?)<\/TD>/gi;
+    const tds = [...block.matchAll(tdRegex)].map(m => {
+      const fontMatch = m[1].match(/<font([^>]*)>([\s\S]*?)<\/font>/i);
+      if (!fontMatch) return null;
+      return {
+        text: fontMatch[2].replace(/<[^>]+>/g, '').trim(),
+        red: /FF0000/i.test(fontMatch[1]),
+      };
     }).filter(Boolean);
 
+    // Keine roten Tags → normale Stunde oder Freistunde → ignorieren
     if (!tds.some(td => td.red)) continue;
 
-    const fach = tds[0]?.text ?? '';
-    // Deduplizierung: Nr-Referenz falls vorhanden, sonst Fach als Fallback
-    const nr = tds.find(td => /^\d+\)$/.test(td.text))?.text ?? fach;
+    // Deduplizierung (rowspan=2 → jeder Block erscheint 2x im HTML)
+    const nrRegex = /^\d+\)$/;
+    const nr = tds.find(td => nrRegex.test(td.text))?.text ?? tds[0]?.text;
     if (seenNrs.has(nr)) continue;
     seenNrs.add(nr);
 
-    fach === '---' ? cancellations++ : substitutions++;
+    const fach   = tds[0]?.text ?? '';
+    const lehrer = tds[tds.length - 1]?.text ?? '';
+
+    // AUSFALL:    Fach UND Lehrer sind beide "---"
+    // VERTRETUNG: nur eines davon (oder keines) ist "---"
+    if (fach === '---' && lehrer === '---') {
+      cancellations++;
+    } else {
+      substitutions++;
+    }
   }
 
   return { cancellations, substitutions, total: cancellations + substitutions };
@@ -178,8 +197,7 @@ function buildPushMessage(substitutions, cancellations, diff) {
 async function sendPushToClass(className, changesCount, message) {
   const deviceTokens = await kv.get(`class:${className}`);
   if (!deviceTokens || !Array.isArray(deviceTokens) || deviceTokens.length === 0) {
-    console.log(`⚠️ No devices for ${className}`);
-    return;
+    console.log(`⚠️ No devices for ${className}`); return;
   }
   console.log(`📤 Sending push to ${deviceTokens.length} device(s) for ${className}`);
   for (const token of deviceTokens) {
@@ -196,13 +214,11 @@ async function sendPushNotificationHTTP2(deviceToken, changesCount, message) {
       });
       const client = http2.connect(`https://${CONFIG.APNS_HOST}`);
       client.on('error', err => { client.close(); reject(err); });
-
       const req = client.request({
         ':method': 'POST', ':scheme': 'https', ':path': `/3/device/${deviceToken}`,
         'authorization': `bearer ${createAPNsJWT()}`,
         'apns-topic': CONFIG.APNS_TOPIC, 'apns-priority': '10', 'apns-push-type': 'alert',
       });
-
       req.setEncoding('utf8');
       let responseData = '';
       req.on('response', headers => {
@@ -219,8 +235,7 @@ async function sendPushNotificationHTTP2(deviceToken, changesCount, message) {
         });
       });
       req.on('error', err => { client.close(); reject(err); });
-      req.write(payload);
-      req.end();
+      req.write(payload); req.end();
     } catch (e) { reject(e); }
   });
 }
