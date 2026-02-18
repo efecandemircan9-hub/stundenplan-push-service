@@ -25,11 +25,9 @@ export default async function handler(req, res) {
     const now = new Date();
     const week = getWeekNumber(now);
     const year = now.getFullYear();
-    const cacheKey = `cache:${className}:${year}:w${week}`; // ← identisch mit check-stundenplan.js
+    const cacheKey = `cache:${className}:${year}:w${week}`;
 
-    // ============================================================
-    // CACHE LÖSCHEN
-    // ============================================================
+    // Cache löschen
     if (action === 'clear') {
       await kv.del(cacheKey);
       return res.status(200).json({
@@ -38,64 +36,33 @@ export default async function handler(req, res) {
       });
     }
 
-    // ============================================================
-    // LADE ECHTES HTML VOM SERVER
-    // ============================================================
-    console.log('📥 Loading real HTML from server...');
-
+    // Echtes HTML laden
     const mappingResponse = await fetch(CONFIG.MAPPING_URL);
     const mapping = await mappingResponse.json();
 
     const slug = mapping[className];
-    if (!slug) {
-      return res.status(404).json({ error: `No slug found for ${className}` });
-    }
+    if (!slug) return res.status(404).json({ error: `No slug found for ${className}` });
 
     const weekFormatted = String(week).padStart(2, '0');
     const url = `${CONFIG.BKB_BASE_URL}/schueler/${weekFormatted}/c/${slug}`;
-    const basicAuth = 'Basic ' + btoa('schueler:stundenplan');
-
-    const response = await fetch(url, { headers: { 'Authorization': basicAuth } });
-    if (!response.ok) {
-      return res.status(500).json({ error: `Failed to fetch: ${response.status}` });
-    }
+    const response = await fetch(url, { headers: { 'Authorization': 'Basic ' + btoa('schueler:stundenplan') } });
+    if (!response.ok) return res.status(500).json({ error: `Failed to fetch: ${response.status}` });
 
     const htmlText = await response.text();
-
-    // ============================================================
-    // ANALYSIERE SERVER-HTML (gleiche Logik wie check-stundenplan.js)
-    // ============================================================
     const normalizedHTML = normalizeHTML(htmlText);
     const serverHash = hashString(normalizedHTML);
-    const serverChanges = parseZwischenplanChanges(htmlText);
-    const serverChangeCount = serverChanges.length;
+    const { substitutions, cancellations, total: serverChangeCount } = countChanges(htmlText);
 
-    console.log(`📊 Server has ${serverChangeCount} change(s) in Zwischenplan`);
-
-    // ============================================================
-    // ERSTELLE FAKE-CACHE MIT WENIGER ÄNDERUNGEN
-    // ============================================================
-
-    // Simuliere: Cache hatte 0 Änderungen (= normaler Stundenplan ohne Vertretungen)
-    const fakeChangeCount = 0;
-    const fakeHash = hashString(normalizedHTML + '__fake__'); // anderer Hash = Änderung wird erkannt
-
-    const fakeCache = {
+    // Fake-Cache mit 0 Änderungen + anderem Hash → check-stundenplan erkennt Differenz
+    const fakeHash = hashString(normalizedHTML + '__fake__');
+    await kv.set(cacheKey, {
       hash: fakeHash,
-      changeCount: fakeChangeCount,
-      updatedAt: new Date(Date.now() - 3600000).toISOString(), // 1 Stunde alt
+      changeCount: 0,
+      updatedAt: new Date(Date.now() - 3600000).toISOString(),
       testMode: true,
-    };
+    });
 
-    await kv.set(cacheKey, fakeCache);
-
-    console.log(`✅ Fake cache written: changeCount=${fakeChangeCount}, hash differs from server`);
-
-    // ============================================================
-    // VORHERSAGE
-    // ============================================================
-    const expectedDiff = serverChangeCount - fakeChangeCount;
-    const willPush = serverChangeCount > fakeChangeCount;
+    const willPush = serverChangeCount > 0;
 
     return res.status(200).json({
       success: true,
@@ -105,49 +72,62 @@ export default async function handler(req, res) {
       year,
       cacheKey,
       server: {
+        substitutions,
+        cancellations,
         changeCount: serverChangeCount,
-        changes: serverChanges,
         hash: serverHash,
       },
       fakeCache: {
-        changeCount: fakeChangeCount,
+        changeCount: 0,
         hash: fakeHash,
       },
       prediction: {
         willSendPush: willPush,
-        expectedNewChanges: expectedDiff,
-        message: willPush
-          ? `✅ PUSH WIRD GESENDET: ${expectedDiff} neue Änderung(en)`
-          : `⚠️ KEIN PUSH: Server hat ${serverChangeCount} Änderungen, Cache hat ${fakeChangeCount} → keine neuen`,
+        expectedNewChanges: serverChangeCount,
+        pushMessage: willPush
+          ? buildPushMessage(substitutions, cancellations, serverChangeCount)
+          : null,
+        verdict: willPush
+          ? `✅ PUSH WIRD GESENDET: ${serverChangeCount} Änderung(en)`
+          : `⚠️ KEIN PUSH: Stundenplan hat aktuell keine roten Einträge`,
       },
-      nextSteps: [
-        `Cache gesetzt mit changeCount=${fakeChangeCount} (Server hat ${serverChangeCount})`,
-        '',
-        'NÄCHSTER SCHRITT:',
-        '   curl https://stundenplan-push-service.vercel.app/api/check-stundenplan',
-        '',
-        willPush
-          ? `🚨 PUSH ERWARTET: +${expectedDiff} neue Änderung(en)`
-          : '⚠️ Kein Push erwartet (keine neuen Einträge im Zwischenplan)',
-      ],
+      nextStep: 'curl https://stundenplan-push-service.vercel.app/api/check-stundenplan',
       quickCommands: {
         trigger: 'curl https://stundenplan-push-service.vercel.app/api/check-stundenplan',
         clear: `curl "https://stundenplan-push-service.vercel.app/api/test-push-smart?className=${className}&action=clear"`,
+        diagnose: `curl "https://stundenplan-push-service.vercel.app/api/diagnose?adminKey=KEY&className=${className}&format=text"`,
       },
     });
 
   } catch (error) {
     console.error('❌ Error:', error);
-    return res.status(500).json({
-      error: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined,
-    });
+    return res.status(500).json({ error: error.message });
   }
 }
 
 // ============================================================================
-// HELPER FUNCTIONS — identisch mit check-stundenplan.js
+// HELPERS — identisch mit check-stundenplan.js
 // ============================================================================
+
+function countChanges(html) {
+  const redTexts = (
+    html.match(/<font[^>]*color=["']?#?FF0000["']?[^>]*>([\s\S]*?)<\/font>/gi) || []
+  ).map(tag => tag.replace(/<[^>]+>/g, '').trim());
+
+  const nrRefs = new Set(redTexts.filter(t => /^\d+\)$/.test(t)));
+  const substitutions = nrRefs.size;
+  const cancellations = Math.floor(redTexts.filter(t => t === '---').length / 2);
+
+  return { substitutions, cancellations, total: substitutions + cancellations };
+}
+
+function buildPushMessage(substitutions, cancellations, diff) {
+  const parts = [];
+  if (cancellations > 0) parts.push(`${cancellations} ${cancellations === 1 ? 'Ausfall' : 'Ausfälle'}`);
+  if (substitutions > 0) parts.push(`${substitutions} ${substitutions === 1 ? 'Vertretung' : 'Vertretungen'}`);
+  if (parts.length > 0) return parts.join(', ') + ' im Stundenplan.';
+  return `${diff} ${diff === 1 ? 'neue Änderung' : 'neue Änderungen'} im Stundenplan.`;
+}
 
 function getWeekNumber(date) {
   const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
@@ -158,7 +138,7 @@ function getWeekNumber(date) {
 }
 
 function normalizeHTML(html) {
-  let normalized = html;
+  let n = html;
   const patterns = [
     /Stand:\s*\d{2}\.\d{2}\.\d{4}\s+\d{2}:\d{2}/gi,
     /generiert.*?\d{2}\.\d{2}\.\d{4}/gi,
@@ -168,45 +148,8 @@ function normalizeHTML(html) {
     /<meta name="GENERATOR"[^>]*>/gi,
     /<title>.*?<\/title>/gi,
   ];
-  for (const pattern of patterns) {
-    normalized = normalized.replace(pattern, '');
-  }
-  return normalized.replace(/\s+/g, ' ').trim();
-}
-
-function parseZwischenplanChanges(html) {
-  const tableMatch = html.match(
-    /<TABLE[^>]*bgcolor=["']#E7E7E7["'][^>]*>([\s\S]*?)<\/TABLE>/i
-  );
-  if (!tableMatch) return [];
-
-  const rows = tableMatch[1].match(/<TR>([\s\S]*?)<\/TR>/gi) || [];
-  const changes = [];
-
-  for (const row of rows.slice(1)) {
-    const cells = (row.match(/<TD[^>]*>([\s\S]*?)<\/TD>/gi) || [])
-      .map(c => c.replace(/<[^>]+>/g, '').replace(/&nbsp;/g, '').trim());
-
-    if (cells[0] && /^\d+\)$/.test(cells[0].trim())) {
-      changes.push({
-        nr: cells[0].trim(),
-        info: cells[1] || '',
-        className: cells[2] || '',
-        week: cells[3] || '',
-      });
-    }
-  }
-
-  // Ausgefallene Stunden (+---+) aus dem Grid zählen
-  const cancelledInGrid = (html.match(
-    /<font[^>]*color=["']?#FF0000["']?[^>]*>\s*\+---\+\s*<\/font>/gi
-  ) || []);
-  const uniqueCancellations = Math.ceil(cancelledInGrid.length / 2);
-  for (let i = 0; i < uniqueCancellations; i++) {
-    changes.push({ nr: `cancelled_${i}`, info: 'Ausfall', className: '', week: '' });
-  }
-
-  return changes;
+  for (const p of patterns) n = n.replace(p, '');
+  return n.replace(/\s+/g, ' ').trim();
 }
 
 function hashString(str) {
